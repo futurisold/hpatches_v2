@@ -23,6 +23,14 @@ class FeatureExtractor:
         pass
 
     def get_regions_of_interest(self, class_path: str, plot: bool = False):
+        '''
+        Each feature is from one of 4 responses: Hessian, Harris, Shi-Tomasi, DoG.                 * (the feature maps)
+        The goal is to identify regions of interest containing features from at least 3 responses. * (the voting scheme)
+        We then create a patch centered at the feature position and check:                         * (the contraints)
+            1) if the patch can be constructed in the reference image
+            2) if the patch can be constructed in the target image after applying the homography
+            3) if the patch doesn't overlap for more than 50% with any other patch already selected
+        '''
         # get class name
         class_name = class_path.split('/')[-1]
         # load ref image
@@ -39,7 +47,7 @@ class FeatureExtractor:
 
         ground_truth = defaultdict(dict)
         # homographies
-        Hs = [f'H_1_{i}' for i in range(2, 6)]
+        Hs = [f'H_1_{i}' for i in range(2, 7)]
         for Hpath in Hs:
             H = np.loadtxt(os.path.join(class_path, Hpath))
             if class_name.startswith('v_'): # viewpoint change
@@ -50,23 +58,20 @@ class FeatureExtractor:
             # get patches
             patches = []
             for name, ref_centroid in ensemble_features:
-                # extract the patches and discard those which are outside the target image
+                # extract the patches and discard 1) those which can't form a patch and 2) those which are outside the target image
                 ref_patch = self.__extract_patch(ref_im, ref_centroid)
+                if ref_patch is None: continue
                 tgt_patch, tgt_centroid = self.__rpc2tpc(tgt_im, ref_centroid, H)
-                if self.__is_valid_patch(tgt_patch):
-                    # find all the feature points that lie inside the ref patch
-                    features_inside_patch = [f for f in ensemble_features if self.__point_inside_patch(f[1], ref_centroid)]
+                if not tgt_patch.size > 0: continue
+                # find all the feature points that lie inside the ref patch
+                features_inside_patch = [f for f in ensemble_features if self.__point_inside_patch(f[1], ref_centroid)]
+                # compare the current patch against all existing patches and check if iou > 0.5; if it is, we discard the current patch
+                # lastly, if there are at least 3 responses in the patch, we keep it
+                shared_features = set([name for name, _ in features_inside_patch])
+                if len(shared_features) >= 3 and self.__is_valid_patch(ref_centroid, patches):
+                    patches.append((ref_centroid, ref_patch, tgt_centroid, tgt_patch))
 
-                    # compare the current patch against all existing patch and check if iou > 0.5; if it is, we discard the current patch
-                    if len(patches):
-                        for centroid, _, _, _ in patches:
-                            if self.__iou(centroid, tgt_centroid) > 0.5: break
-
-                    # lastly, if there are at least 3 responses in the patch, we keep it
-                    if len(set([name for name, _ in features_inside_patch])) >= 3:
-                        patches.append((ref_centroid, ref_patch, tgt_centroid, tgt_patch))
-
-                if len(patches) == 500: break
+                if len(patches) == 50: break
 
             if plot: self.__plot_patches(ref_im, patches)
 
@@ -100,28 +105,40 @@ class FeatureExtractor:
 
         return dog
 
-    def __is_valid_patch(self, tgt_patch: np.ndarray):
-        # given how the patches are extracted, some of them might be outside the image
-        # if this happens, the patch is empty and we discard it
-        return tgt_patch.size > 0
+    def __is_valid_patch(self, ref_centroid: np.ndarray, patches: list[tuple]):
+        # compare the current patch against all existing patches
+        if len(patches) == 0: return True
+        for centroid, _, _, _ in patches:
+            if self.__iou(centroid, ref_centroid) > 0.5: return False
+        return True
 
-    def __iou(self, ref_centroid: np.ndarray, tgt_centroid: np.ndarray):
-        x1, y1 = ref_centroid
-        x2, y2 = tgt_centroid
-        x_min = max(x1, x2)
-        y_min = max(y1, y2)
-        x_max = min(x1 + self.patch_size, x2 + self.patch_size)
-        y_max = min(y1 + self.patch_size, y2 + self.patch_size)
-        intersection = max(0, x_max - x_min) * max(0, y_max - y_min)
+    def __iou(self, centroid: np.ndarray, ref_centroid: np.ndarray):
+        x1, y1 = centroid
+        x2, y2 = ref_centroid
+        # keep into account the fact that the patches are centered on the feature points
+        x_left   = max(x1 - self.patch_size // 2, x2 - self.patch_size // 2)
+        x_right  = min(x1 + self.patch_size // 2, x2 + self.patch_size // 2)
+        y_top    = max(y1 - self.patch_size // 2, y2 - self.patch_size // 2)
+        y_bottom = min(y1 + self.patch_size // 2, y2 + self.patch_size // 2)
+
+        intersection = max(0, x_right - x_left) * max(0, y_bottom - y_top)
         union = self.patch_size ** 2 + self.patch_size ** 2 - intersection
+        iou = intersection / union
+        assert 0 <= iou <= 1
 
-        return intersection / union
+        return iou
 
     def __extract_patch(self, im: np.ndarray, centroid: np.ndarray):
-        # get the top left corner of the patch
         x, y = centroid
+        # extract the patch centered on (x, y)
+        x_min = x - self.patch_size // 2
+        x_max = x + self.patch_size // 2
+        y_min = y - self.patch_size // 2
+        y_max = y + self.patch_size // 2
+        # check if the patch is inside the image
+        if x_min < 0 or x_max > im.shape[1] or y_min < 0 or y_max > im.shape[0]: return None
         # extract the patch
-        patch = im[y: y + self.patch_size, x: x + self.patch_size]
+        patch = im[y_min:y_max, x_min:x_max]
 
         return patch
 
@@ -147,12 +164,14 @@ class FeatureExtractor:
         # extract the patch
         patch = im[y_min: y_max, x_min: x_max]
 
-        return patch, (x_min, y_min)
+        return patch, np.array([x_min, y_min])
 
-    def __point_inside_patch(self, feature: np.ndarray, patch: np.ndarray):
-        x, y = feature
-        x_min, y_min = patch
-        x_max, y_max = x_min + self.patch_size, y_min + self.patch_size
+    def __point_inside_patch(self, point: np.ndarray, ref_centroid: np.ndarray):
+        x, y = point
+        x_min = ref_centroid[0] - self.patch_size // 2
+        x_max = ref_centroid[0] + self.patch_size // 2
+        y_min = ref_centroid[1] - self.patch_size // 2
+        y_max = ref_centroid[1] + self.patch_size // 2
 
         return x_min <= x <= x_max and y_min <= y <= y_max
 
@@ -183,9 +202,13 @@ class FeatureExtractor:
     def __plot_patches(self, ref_im: np.ndarray, patches: list[tuple]):
         _, ax = plt.subplots(1, 1, figsize=(10, 5))
         ax.imshow(ref_im, cmap='gray')
-        for ref_centroid, ref_patch, _, _ in patches:
-            # draw a rectangle around the patch
-            ax.add_patch(plt.Rectangle(ref_centroid, *ref_patch.shape[::-1], fill=False, edgecolor='red', linewidth=2))
+        for ref_centroid, _, _, _ in patches:
+            # draw a rectangle centered on the centroid
+            x, y = ref_centroid
+            rect = mpatches.Rectangle((x - self.patch_size // 2, y - self.patch_size // 2), self.patch_size, self.patch_size, linewidth=1, edgecolor='r', facecolor='none')
+            ax.add_patch(rect)
+            ax.scatter(x, y, c='navy', marker='+', s=5)
+
         plt.show()
 
 
