@@ -1,0 +1,6 @@
+dataset:
+  path: "./data/hpatches-sequences-release"
+  patch_size: 65
+  resolution: [640, 480]
+  keep_aspect_ratio: true
+

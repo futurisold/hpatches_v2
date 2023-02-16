@@ -7,17 +7,19 @@ import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import yaml
 from kornia.feature import gftt_response, harris_response, hessian_response
 
-# TODO: create a config file
 # TODO: multiproc generate dataset func
+# TODO: extend the config file to include the params
 
 class FeatureExtractor:
-    def __init__(self,
-                 hsr_path: str, # hpatches-sequences-release
-                 patch_size: int = 65):
-        self.files = glob.glob(os.path.join(hsr_path, '*'))
-        self.patch_size = patch_size
+    def __init__(self, config_path: str):
+        self.config            = yaml.safe_load(open(config_path))
+        self.files             = glob.glob(os.path.join(self.config.get('dataset').get('path'), '*'))
+        self.resolution        = tuple(self.config.get('dataset').get('resolution'))
+        self.patch_size        = self.config.get('dataset').get('patch_size')
+        self.keep_aspect_ratio = self.config.get('dataset').get('keep_aspect_ratio')
 
     def generate_dataset(self):
         pass
@@ -36,6 +38,8 @@ class FeatureExtractor:
         # load ref image
         ref_im = cv2.imread(os.path.join(class_path, '1.ppm')).astype('uint8')
         ref_im = cv2.cvtColor(ref_im, cv2.COLOR_BGR2GRAY)
+        original_resolution = ref_im.shape
+        if self.resolution is not None: ref_im = self.__resize(ref_im)
         # get feature maps
         feat_maps = self.get_feature_maps(ref_im)
         # get good features
@@ -50,11 +54,16 @@ class FeatureExtractor:
         Hs = [f'H_1_{i}' for i in range(2, 7)]
         for Hpath in Hs:
             H = np.loadtxt(os.path.join(class_path, Hpath))
+            if self.resolution is not None: H = self.__adapt_homography(H, original_resolution)
             if class_name.startswith('v_'): # viewpoint change
                 tgt_im = cv2.warpPerspective(ref_im, H, ref_im.shape[::-1]).astype('uint8')
             else: # illumination change
                 tgt_im = cv2.imread(os.path.join(class_path, f'{Hpath[-1]}.ppm')).astype('uint8')
                 tgt_im = cv2.cvtColor(tgt_im, cv2.COLOR_BGR2GRAY)
+                if self.resolution is not None: tgt_im = self.__resize(tgt_im) if tgt_im.shape != self.resolution else tgt_im
+
+            assert ref_im.shape == tgt_im.shape == self.resolution, f'Failed to resize images: {ref_im.shape} | {tgt_im.shape} != {self.resolution}'
+
             # get patches
             patches = []
             for name, ref_centroid in ensemble_features:
@@ -71,9 +80,9 @@ class FeatureExtractor:
                 if len(shared_features) >= 3 and self.__is_valid_patch(ref_centroid, patches):
                     patches.append((ref_centroid, ref_patch, tgt_centroid, tgt_patch))
 
-                if len(patches) == 50: break
+                if len(patches) == 100: break
 
-            if plot: self.__plot_patches(ref_im, patches)
+            if plot: self.__plot_patches(ref_im, tgt_im, patches)
 
             # save patches
             ground_truth[class_name][Hpath] = patches
@@ -175,6 +184,34 @@ class FeatureExtractor:
 
         return x_min <= x <= x_max and y_min <= y <= y_max
 
+    def __resize(self, im: np.ndarray):
+        # resize the image to the resolution and keep the aspect ratio of the original image
+        h, w = self.resolution
+        h0, w0 = im.shape[:2]
+        if self.keep_aspect_ratio:
+            if h0 / w0 > h / w: h = int(h0 * w / w0) # the height is the limiting factor
+            else: w = int(w0 * h / h0) # the width is the limiting factor
+        # resize and pad
+        im = cv2.resize(im, (w, h), interpolation=cv2.INTER_AREA if h < h0 or w < w0 else cv2.INTER_CUBIC)
+        if not self.keep_aspect_ratio: # if we don't keep the aspect ratio, we must pad the image
+            im = cv2.copyMakeBorder(im, 0, h - im.shape[0], 0, w - im.shape[1], cv2.BORDER_CONSTANT, value=0)
+
+        return im
+
+    def __adapt_homography(self, H: np.ndarray, original_resolution: tuple):
+        # because we changed the resolution of the reference image, we must adapt the homography accordingly
+        # formula: H' = S * H * S^-1 (where S is the scaling matrix)
+        h, w = self.resolution
+        h0, w0 = original_resolution
+        S = np.array([
+            [w / w0, 0, 0],
+            [0, h / h0, 0],
+            [0, 0, 1]
+        ])
+        H = S @ H @ np.linalg.inv(S)
+
+        return H
+
     # viz helpers
     # =============================================================================================================
     def __plot_ensemble_features(self, im: np.ndarray, ensemble_features: list[tuple]):
@@ -199,20 +236,16 @@ class FeatureExtractor:
             ax[i // 2, i % 2].set_title(name)
         plt.show()
 
-    def __plot_patches(self, ref_im: np.ndarray, patches: list[tuple]):
-        _, ax = plt.subplots(1, 1, figsize=(10, 5))
-        ax.imshow(ref_im, cmap='gray')
+    def __plot_patches(self, ref_im: np.ndarray, tgt_im: np.ndarray, patches: list[tuple]):
+        _, ax = plt.subplots(1, 2, figsize=(10, 5))
+        ax[0].imshow(ref_im, cmap='gray')
+        ax[1].imshow(tgt_im, cmap='gray')
         for ref_centroid, _, _, _ in patches:
             # draw a rectangle centered on the centroid
             x, y = ref_centroid
             rect = mpatches.Rectangle((x - self.patch_size // 2, y - self.patch_size // 2), self.patch_size, self.patch_size, linewidth=1, edgecolor='r', facecolor='none')
-            ax.add_patch(rect)
-            ax.scatter(x, y, c='navy', marker='+', s=5)
+            ax[0].add_patch(rect)
+            ax[0].scatter(x, y, c='navy', marker='+', s=5)
 
         plt.show()
-
-
-if __name__ == '__main__':
-    extractor = FeatureExtractor('./data/hpatches-sequences-release')
-    extractor.get_regions_of_interest('./data/hpatches-sequences-release/v_charing', plot=True)
 
