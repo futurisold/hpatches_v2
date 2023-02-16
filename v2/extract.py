@@ -185,12 +185,11 @@ class FeatureExtractor:
         return x_min <= x <= x_max and y_min <= y <= y_max
 
     def __resize(self, im: np.ndarray):
-        # resize the image to the resolution and keep the aspect ratio of the original image
         h, w = self.resolution
         h0, w0 = im.shape[:2]
         if self.keep_aspect_ratio:
             if h0 / w0 > h / w: h = int(h0 * w / w0) # the height is the limiting factor
-            else: w = int(w0 * h / h0) # the width is the limiting factor
+            else: w = int(w0 * h / h0)               # the width is the limiting factor
         # resize and pad
         im = cv2.resize(im, (w, h), interpolation=cv2.INTER_AREA if h < h0 or w < w0 else cv2.INTER_CUBIC)
         if not self.keep_aspect_ratio: # if we don't keep the aspect ratio, we must pad the image
@@ -248,4 +247,9 @@ class FeatureExtractor:
             ax[0].scatter(x, y, c='navy', marker='+', s=5)
 
         plt.show()
+
+
+if __name__ == '__main__':
+    extractor = FeatureExtractor('./config.yaml')
+    extractor.get_regions_of_interest('./data/hpatches-sequences-release/v_charing', plot=True)
 
