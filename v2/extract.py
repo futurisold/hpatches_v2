@@ -107,15 +107,16 @@ class FeatureExtractor:
             # save only the centroids (patches can be reconstructed from the centroids)
             res[class_name][H_name] = [(c1, c2) for c1, _, c2, _ in patches]
 
+        # don't save when using the function as an exploration tool
+        if plot: return
+
         # dump patches
         obj = Path(self.dump_location) / f'{class_name}.pkl'
         if os.path.exists(obj):
             print(f'File {obj} already exists')
             return
 
-        with open(obj, 'wb') as f:
-            # don't save when using the function as an exploration tool
-            pickle.dump(res[class_name], f, protocol=pickle.HIGHEST_PROTOCOL)
+        with open(obj, 'wb') as f: pickle.dump(res[class_name], f, protocol=pickle.HIGHEST_PROTOCOL)
 
     def get_good_features(self, feature_maps: list[tuple]):
         ensemble_features = []
