@@ -286,9 +286,3 @@ class FeatureExtractor:
 
         plt.show()
 
-
-if __name__ == '__main__':
-    extractor = FeatureExtractor('./config.yaml')
-    # extractor.get_regions_of_interest('./data/hpatches-sequences-release/i_pool', plot=True)
-    extractor.generate_dataset()
-
