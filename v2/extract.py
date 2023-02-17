@@ -1,6 +1,10 @@
 import glob
 import os
+import pickle
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor
+from multiprocessing import Pool
+from pathlib import Path
 
 import cv2
 import matplotlib.patches as mpatches
@@ -10,19 +14,34 @@ import torch
 import yaml
 from kornia.feature import gftt_response, harris_response, hessian_response
 
-# TODO: multiproc generate dataset func
-# TODO: extend the config file to include the params
 
 class FeatureExtractor:
     def __init__(self, config_path: str):
         self.config            = yaml.safe_load(open(config_path))
         self.files             = glob.glob(os.path.join(self.config.get('dataset').get('path'), '*'))
-        self.resolution        = tuple(self.config.get('dataset').get('resolution'))
+        self.resolution        = self.config.get('dataset').get('resolution')
         self.patch_size        = self.config.get('dataset').get('patch_size')
         self.keep_aspect_ratio = self.config.get('dataset').get('keep_aspect_ratio')
+        self.samples           = self.config.get('dataset').get('samples')
+        self.dump_location     = self.config.get('dataset').get('dump_location')
+        self.threads           = self.config.get('dataset').get('threads')
+        self.shared_features   = self.config.get('feature_extraction').get('shared_features')
+        self.iou_threshold     = self.config.get('feature_extraction').get('iou_threshold')
+        self.max_corners       = self.config.get('feature_extraction').get('max_corners')
+        self.quality_level     = self.config.get('feature_extraction').get('quality_level')
+        self.min_dist          = self.config.get('feature_extraction').get('min_dist')
+        self.block_size        = self.config.get('feature_extraction').get('block_size')
 
     def generate_dataset(self):
-        pass
+        # check if directory already exists (cache)
+        if os.path.exists(self.dump_location):
+            print(f'Found cache at {self.dump_location}')
+            return
+        # create directory
+        os.makedirs(self.dump_location)
+        # extract features
+        with Pool(self.threads) as p: p.map(self.get_regions_of_interest, self.files)
+        print(f'Finished extracting features and dumped them at {self.dump_location}')
 
     def get_regions_of_interest(self, class_path: str, plot: bool = False):
         '''
@@ -39,7 +58,7 @@ class FeatureExtractor:
         ref_im = cv2.imread(os.path.join(class_path, '1.ppm')).astype('uint8')
         ref_im = cv2.cvtColor(ref_im, cv2.COLOR_BGR2GRAY)
         original_resolution = ref_im.shape
-        if self.resolution is not None: ref_im = self.__resize(ref_im)
+        if self.resolution is not None: ref_im = self.resize(ref_im)
         # get feature maps
         feat_maps = self.get_feature_maps(ref_im)
         # get good features
@@ -49,48 +68,65 @@ class FeatureExtractor:
             self.__plot_feature_maps(*feat_maps)
             self.__plot_ensemble_features(ref_im, ensemble_features)
 
-        ground_truth = defaultdict(dict)
+        res = defaultdict(dict)
         # homographies
         Hs = [f'H_1_{i}' for i in range(2, 7)]
-        for Hpath in Hs:
-            H = np.loadtxt(os.path.join(class_path, Hpath))
-            if self.resolution is not None: H = self.__adapt_homography(H, original_resolution)
+        for H_name in Hs:
+            H = np.loadtxt(os.path.join(class_path, H_name))
+            if self.resolution is not None: H = self.adapt_homography(H, original_resolution)
             if class_name.startswith('v_'): # viewpoint change
                 tgt_im = cv2.warpPerspective(ref_im, H, ref_im.shape[::-1]).astype('uint8')
             else: # illumination change
-                tgt_im = cv2.imread(os.path.join(class_path, f'{Hpath[-1]}.ppm')).astype('uint8')
+                tgt_im = cv2.imread(os.path.join(class_path, f'{H_name[-1]}.ppm')).astype('uint8')
                 tgt_im = cv2.cvtColor(tgt_im, cv2.COLOR_BGR2GRAY)
-                if self.resolution is not None: tgt_im = self.__resize(tgt_im) if tgt_im.shape != self.resolution else tgt_im
+                if self.resolution is not None: tgt_im = self.resize(tgt_im) if tgt_im.shape != self.resolution else tgt_im
 
-            assert ref_im.shape == tgt_im.shape == self.resolution, f'Failed to resize images: {ref_im.shape} | {tgt_im.shape} != {self.resolution}'
+            if self.resolution is not None:
+                assert ref_im.shape == tgt_im.shape == tuple(self.resolution), f'Failed to resize images: {ref_im.shape} | {tgt_im.shape} != {self.resolution}'
 
             # get patches
             patches = []
             for name, ref_centroid in ensemble_features:
                 # extract the patches and discard 1) those which can't form a patch and 2) those which are outside the target image
-                ref_patch = self.__extract_patch(ref_im, ref_centroid)
+                ref_patch = self.extract_patch(ref_im, ref_centroid)
                 if ref_patch is None: continue
-                tgt_patch, tgt_centroid = self.__rpc2tpc(tgt_im, ref_centroid, H)
+                tgt_patch, tgt_centroid = self.rpc2tpc(tgt_im, ref_centroid, H)
                 if not tgt_patch.size > 0: continue
                 # find all the feature points that lie inside the ref patch
-                features_inside_patch = [f for f in ensemble_features if self.__point_inside_patch(f[1], ref_centroid)]
+                features_inside_patch = [f for f in ensemble_features if self.point_inside_patch(f[1], ref_centroid)]
                 # compare the current patch against all existing patches and check if iou > 0.5; if it is, we discard the current patch
                 # lastly, if there are at least 3 responses in the patch, we keep it
                 shared_features = set([name for name, _ in features_inside_patch])
-                if len(shared_features) >= 3 and self.__is_valid_patch(ref_centroid, patches):
+                if len(shared_features) >= self.shared_features and self.__is_valid_patch(ref_centroid, patches):
                     patches.append((ref_centroid, ref_patch, tgt_centroid, tgt_patch))
 
-                if len(patches) == 100: break
+                if len(patches) == self.samples // len(Hs): break
 
             if plot: self.__plot_patches(ref_im, tgt_im, patches)
 
-            # save patches
-            ground_truth[class_name][Hpath] = patches
+            # save only the centroids (patches can be reconstructed from the centroids)
+            res[class_name][H_name] = [(c1, c2) for c1, _, c2, _ in patches]
+
+        # dump patches
+        obj = Path(self.dump_location) / f'{class_name}.pkl'
+        if os.path.exists(obj):
+            print(f'File {obj} already exists')
+            return
+
+        with open(obj, 'wb') as f:
+            # don't save when using the function as an exploration tool
+            pickle.dump(res[class_name], f, protocol=pickle.HIGHEST_PROTOCOL)
 
     def get_good_features(self, feature_maps: list[tuple]):
         ensemble_features = []
         for response, feat_map in feature_maps:
-            features = cv2.goodFeaturesToTrack(feat_map, maxCorners=1000, qualityLevel=0.01, minDistance=10, blockSize=3).squeeze()
+            features = cv2.goodFeaturesToTrack(
+                    feat_map,
+                    maxCorners=self.max_corners,
+                    qualityLevel=self.quality_level,
+                    minDistance=self.min_dist,
+                    blockSize=self.block_size
+            ).squeeze()
             ensemble_features.extend((response, feat.astype(int)) for feat in features)
 
         return ensemble_features
@@ -105,39 +141,7 @@ class FeatureExtractor:
             ('dog', self.__dog_response(tmp_im))
         ]
 
-    def __dog_response(self, im, sigma1=1., sigma2=1.6):
-        # compute the gaussian blur of the image
-        im_blur1 = cv2.GaussianBlur(im.squeeze().numpy(), (0, 0), sigma1)
-        im_blur2 = cv2.GaussianBlur(im.squeeze().numpy(), (0, 0), sigma2)
-        # compute the difference of gaussian
-        dog = im_blur1 - im_blur2
-
-        return dog
-
-    def __is_valid_patch(self, ref_centroid: np.ndarray, patches: list[tuple]):
-        # compare the current patch against all existing patches
-        if len(patches) == 0: return True
-        for centroid, _, _, _ in patches:
-            if self.__iou(centroid, ref_centroid) > 0.5: return False
-        return True
-
-    def __iou(self, centroid: np.ndarray, ref_centroid: np.ndarray):
-        x1, y1 = centroid
-        x2, y2 = ref_centroid
-        # keep into account the fact that the patches are centered on the feature points
-        x_left   = max(x1 - self.patch_size // 2, x2 - self.patch_size // 2)
-        x_right  = min(x1 + self.patch_size // 2, x2 + self.patch_size // 2)
-        y_top    = max(y1 - self.patch_size // 2, y2 - self.patch_size // 2)
-        y_bottom = min(y1 + self.patch_size // 2, y2 + self.patch_size // 2)
-
-        intersection = max(0, x_right - x_left) * max(0, y_bottom - y_top)
-        union = self.patch_size ** 2 + self.patch_size ** 2 - intersection
-        iou = intersection / union
-        assert 0 <= iou <= 1
-
-        return iou
-
-    def __extract_patch(self, im: np.ndarray, centroid: np.ndarray):
+    def extract_patch(self, im: np.ndarray, centroid: np.ndarray):
         x, y = centroid
         # extract the patch centered on (x, y)
         x_min = x - self.patch_size // 2
@@ -151,7 +155,7 @@ class FeatureExtractor:
 
         return patch
 
-    def __rpc2tpc(self, im: np.ndarray, ref_centroid: np.ndarray, H: np.ndarray):
+    def rpc2tpc(self, im: np.ndarray, ref_centroid: np.ndarray, H: np.ndarray):
         # get the corners of the patch in the target image
         x_min, y_min = ref_centroid
         corners = np.array(
@@ -175,7 +179,7 @@ class FeatureExtractor:
 
         return patch, np.array([x_min, y_min])
 
-    def __point_inside_patch(self, point: np.ndarray, ref_centroid: np.ndarray):
+    def point_inside_patch(self, point: np.ndarray, ref_centroid: np.ndarray):
         x, y = point
         x_min = ref_centroid[0] - self.patch_size // 2
         x_max = ref_centroid[0] + self.patch_size // 2
@@ -184,7 +188,9 @@ class FeatureExtractor:
 
         return x_min <= x <= x_max and y_min <= y <= y_max
 
-    def __resize(self, im: np.ndarray):
+    def resize(self, im: np.ndarray):
+        if self.resolution is None: return im
+
         h, w = self.resolution
         h0, w0 = im.shape[:2]
         if self.keep_aspect_ratio:
@@ -197,7 +203,7 @@ class FeatureExtractor:
 
         return im
 
-    def __adapt_homography(self, H: np.ndarray, original_resolution: tuple):
+    def adapt_homography(self, H: np.ndarray, original_resolution: tuple):
         # because we changed the resolution of the reference image, we must adapt the homography accordingly
         # formula: H' = S * H * S^-1 (where S is the scaling matrix)
         h, w = self.resolution
@@ -210,6 +216,38 @@ class FeatureExtractor:
         H = S @ H @ np.linalg.inv(S)
 
         return H
+
+    def __dog_response(self, im):
+        # compute the gaussian blur of the image
+        im_blur1 = cv2.GaussianBlur(im.squeeze().numpy(), (0, 0), 1.)
+        im_blur2 = cv2.GaussianBlur(im.squeeze().numpy(), (0, 0), 1.6)
+        # compute the difference of gaussian
+        dog = im_blur1 - im_blur2
+
+        return dog
+
+    def __is_valid_patch(self, ref_centroid: np.ndarray, patches: list[tuple]):
+        # compare the current patch against all existing patches
+        if len(patches) == 0: return True
+        for centroid, _, _, _ in patches:
+            if self.__iou(centroid, ref_centroid) > self.iou_threshold: return False
+        return True
+
+    def __iou(self, centroid: np.ndarray, ref_centroid: np.ndarray):
+        x1, y1 = centroid
+        x2, y2 = ref_centroid
+        # keep into account the fact that the patches are centered on the feature points
+        x_left   = max(x1 - self.patch_size // 2, x2 - self.patch_size // 2)
+        x_right  = min(x1 + self.patch_size // 2, x2 + self.patch_size // 2)
+        y_top    = max(y1 - self.patch_size // 2, y2 - self.patch_size // 2)
+        y_bottom = min(y1 + self.patch_size // 2, y2 + self.patch_size // 2)
+
+        intersection = max(0, x_right - x_left) * max(0, y_bottom - y_top)
+        union = self.patch_size ** 2 + self.patch_size ** 2 - intersection
+        iou = intersection / union
+        assert 0 <= iou <= 1
+
+        return iou
 
     # viz helpers
     # =============================================================================================================
@@ -251,5 +289,6 @@ class FeatureExtractor:
 
 if __name__ == '__main__':
     extractor = FeatureExtractor('./config.yaml')
-    extractor.get_regions_of_interest('./data/hpatches-sequences-release/v_charing', plot=True)
+    # extractor.get_regions_of_interest('./data/hpatches-sequences-release/i_pool', plot=True)
+    extractor.generate_dataset()
 

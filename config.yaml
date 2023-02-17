@@ -1,6 +1,16 @@
 dataset:
   path: "./data/hpatches-sequences-release"
   patch_size: 65
-  resolution: [640, 480]
-  keep_aspect_ratio: true
+  resolution: [640, 480] # [H, W] or null
+  keep_aspect_ratio: false # if false, it performs padding
+  samples: 1000 # is not a guarantee you'll get this many samples - view it as the upper bound
+  dump_location: "./data/dataset"
+  threads: 6
 
+feature_extraction:
+  shared_features: 3
+  iou_threshold: 0.5
+  max_corners: 1000
+  quality_level: 0.01
+  min_dist: 10
+  block_size: 3
