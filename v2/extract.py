@@ -90,7 +90,7 @@ class FeatureExtractor:
                 # extract the patches and discard 1) those which can't form a patch and 2) those which are outside the target image
                 ref_patch = self.extract_patch(ref_im, ref_centroid)
                 if ref_patch is None: continue
-                tgt_patch, tgt_centroid = self.rpc2tpc(tgt_im, ref_centroid, H)
+                tgt_patch, tgt_centroid = self.__rpc2tpc(tgt_im, ref_centroid, H)
                 if not tgt_patch.size > 0: continue
                 # find all the feature points that lie inside the ref patch
                 features_inside_patch = [f for f in ensemble_features if self.point_inside_patch(f[1], ref_centroid)]
@@ -155,30 +155,6 @@ class FeatureExtractor:
 
         return patch
 
-    def rpc2tpc(self, im: np.ndarray, ref_centroid: np.ndarray, H: np.ndarray):
-        # get the corners of the patch in the target image
-        x_min, y_min = ref_centroid
-        corners = np.array(
-            [[x_min, y_min],
-             [x_min, y_min + self.patch_size],
-             [x_min + self.patch_size, y_min + self.patch_size],
-             [x_min + self.patch_size, y_min]]
-        ).astype(np.float32)
-        # apply the homography to the corners
-        corners = cv2.perspectiveTransform(corners[None, ...], H).squeeze()
-        # find the bounding box of the transformed patch in the target image
-        x_min, y_min = np.min(corners, axis=0).astype(int)
-        x_max, y_max = np.max(corners, axis=0).astype(int)
-
-        # discard rectangles that are outside the image
-        if x_min < 0 or y_min < 0 or x_max > im.shape[1] or y_max > im.shape[0]:
-            return np.array([]), (0, 0)
-
-        # extract the patch
-        patch = im[y_min: y_max, x_min: x_max]
-
-        return patch, np.array([x_min, y_min])
-
     def point_inside_patch(self, point: np.ndarray, ref_centroid: np.ndarray):
         x, y = point
         x_min = ref_centroid[0] - self.patch_size // 2
@@ -225,6 +201,30 @@ class FeatureExtractor:
         dog = im_blur1 - im_blur2
 
         return dog
+
+    def __rpc2tpc(self, im: np.ndarray, ref_centroid: np.ndarray, H: np.ndarray):
+        # get the corners of the patch in the target image
+        x_min, y_min = ref_centroid
+        corners = np.array(
+            [[x_min, y_min],
+             [x_min, y_min + self.patch_size],
+             [x_min + self.patch_size, y_min + self.patch_size],
+             [x_min + self.patch_size, y_min]]
+        ).astype(np.float32)
+        # apply the homography to the corners
+        corners = cv2.perspectiveTransform(corners[None, ...], H).squeeze()
+        # find the bounding box of the transformed patch in the target image
+        x_min, y_min = np.min(corners, axis=0).astype(int)
+        x_max, y_max = np.max(corners, axis=0).astype(int)
+
+        # discard rectangles that are outside the image
+        if x_min < 0 or y_min < 0 or x_max > im.shape[1] or y_max > im.shape[0]:
+            return np.array([]), (0, 0)
+
+        # extract the patch
+        patch = im[y_min: y_max, x_min: x_max]
+
+        return patch, np.array([x_min, y_min])
 
     def __is_valid_patch(self, ref_centroid: np.ndarray, patches: list[tuple]):
         # compare the current patch against all existing patches
