@@ -78,7 +78,7 @@ class FeatureExtractor:
             else: # illumination change
                 tgt_im = cv2.imread(os.path.join(class_path, f'{H_name[-1]}.ppm')).astype('uint8')
                 tgt_im = cv2.cvtColor(tgt_im, cv2.COLOR_BGR2GRAY)
-                if self.resolution is not None: tgt_im = self.resize(tgt_im) if tgt_im.shape != self.resolution else tgt_im
+                if self.resolution is not None: tgt_im = self.resize(tgt_im)
 
             if self.resolution is not None:
                 assert ref_im.shape == tgt_im.shape == tuple(self.resolution), f'Failed to resize images: {ref_im.shape} | {tgt_im.shape} != {self.resolution}'
