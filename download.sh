@@ -12,10 +12,12 @@ fi
 
 mkdir -p ./data
 echo ">> Downloading..."
-wget -O ./data/hpatches-release.tar.gz $hpatches_url --no-check-certificate
-wget -O ./data/hpatches-sequences-release.tar.gz $hpatches_sequences --no-check-certificate
+wget -O ./data/hpatches-release.tar.gz $hpatches_url --no-check-certificate &
+wget -O ./data/hpatches-sequences-release.tar.gz $hpatches_sequences --no-check-certificate &
+wait
 echo ">> Extracting..."
-tar -xzf ./data/hpatches-release.tar.gz -C ./data
-tar -xzf ./data/hpatches-sequences-release.tar.gz -C ./data
+tar -xzf ./data/hpatches-release.tar.gz -C ./data &
+tar -xzf ./data/hpatches-sequences-release.tar.gz -C ./data &
+wait
 rm ./data/hpatches-release.tar.gz ./data/hpatches-sequences-release.tar.gz
 echo ">> Done!"
